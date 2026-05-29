@@ -1,6 +1,9 @@
 package main
 
-// ebcdicToASCII maps EBCDIC byte values to ASCII
+import "unicode/utf8"
+
+// ebcdicToASCII maps EBCDIC byte values to Latin-1 (ISO-8859-1) code points.
+// The table is unchanged — it already covers the full 256-entry Latin-1 range.
 var ebcdicToASCII = [256]byte{
 	0x00, 0x01, 0x02, 0x03, 0x9C, 0x09, 0x86, 0x7F, 0x97, 0x8D, 0x8E, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
 	0x10, 0x11, 0x12, 0x13, 0x9D, 0x0A, 0x08, 0x87, 0x18, 0x19, 0x92, 0x8F, 0x1C, 0x1D, 0x1E, 0x1F,
@@ -20,7 +23,9 @@ var ebcdicToASCII = [256]byte{
 	0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0xB3, 0xDB, 0xDC, 0xD9, 0xDA, 0x9F,
 }
 
-// asciiToEBCDIC maps ASCII byte values to EBCDIC
+// asciiToEBCDIC maps Latin-1 (ISO-8859-1) byte values to EBCDIC.
+// The table covers all 256 entries, including the extended Latin-1 range
+// (0x80–0xFF) used by Danish/Nordic characters such as æ Æ ø Ø å Å.
 var asciiToEBCDIC = [256]byte{
 	0x00, 0x01, 0x02, 0x03, 0x37, 0x2D, 0x2E, 0x2F, 0x16, 0x05, 0x15, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
 	0x10, 0x11, 0x12, 0x13, 0x3C, 0x3D, 0x32, 0x26, 0x18, 0x19, 0x3F, 0x27, 0x1C, 0x1D, 0x1E, 0x1F,
@@ -40,30 +45,75 @@ var asciiToEBCDIC = [256]byte{
 	0x8C, 0x49, 0xCD, 0xCE, 0xCB, 0xCF, 0xCC, 0xE1, 0x70, 0xDD, 0xDE, 0xDB, 0xDC, 0x8D, 0x8E, 0xDF,
 }
 
-// toEBCDIC converts an ASCII string to EBCDIC bytes
+// toEBCDIC converts a UTF-8 string to EBCDIC bytes.
+//
+// Gopher servers send UTF-8. Characters in the Basic Latin block (U+0000–U+007F)
+// map 1:1 to Latin-1. Characters in the Latin-1 Supplement block (U+0080–U+00FF)
+// — which includes all Danish/Nordic letters (æ Æ ø Ø å Å) — are identical in
+// value to their Latin-1 code points and can be looked up directly in
+// asciiToEBCDIC. Code points above U+00FF have no EBCDIC equivalent and are
+// replaced with a space.
 func toEBCDIC(s string) []byte {
-	out := make([]byte, len(s))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c > 127 {
-			out[i] = 0x40 // space for non-ASCII
+	out := make([]byte, 0, len(s))
+	for _, r := range s { // iterates UTF-8 runes
+		if r <= 0xFF {
+			// Latin-1 range: rune value == Latin-1 byte value
+			out = append(out, asciiToEBCDIC[byte(r)])
 		} else {
-			out[i] = asciiToEBCDIC[c]
+			// Beyond Latin-1 — try a best-effort ASCII transliteration,
+			// otherwise fall back to space.
+			out = append(out, asciiToEBCDIC[runeToLatin1Approx(r)])
 		}
 	}
 	return out
 }
 
-// fromEBCDIC converts EBCDIC bytes to an ASCII string
+// fromEBCDIC converts EBCDIC bytes to a UTF-8 string.
+//
+// ebcdicToASCII already returns Latin-1 code points.  For bytes in the
+// printable ASCII range (0x20–0x7E) the Latin-1 value is also a valid UTF-8
+// byte, so we emit it as-is.  For values in 0x80–0xFF (extended Latin-1,
+// including æ Æ ø Ø å Å) we encode the rune as UTF-8 (two bytes) so the
+// resulting Go string is well-formed.  Control characters are replaced with
+// a space.
 func fromEBCDIC(b []byte) string {
-	out := make([]byte, len(b))
-	for i, c := range b {
-		a := ebcdicToASCII[c]
-		if a < 0x20 || a > 0x7E {
-			out[i] = ' '
-		} else {
-			out[i] = a
+	out := make([]byte, 0, len(b))
+	for _, c := range b {
+		latin1 := ebcdicToASCII[c]
+		r := rune(latin1)
+		switch {
+		case r >= 0x20 && r <= 0x7E:
+			// Plain ASCII — single byte
+			out = append(out, byte(r))
+		case r >= 0xA0:
+			// Extended Latin-1 printable (includes æøåÆØÅ etc.) — encode as UTF-8
+			var buf [utf8.UTFMax]byte
+			n := utf8.EncodeRune(buf[:], r)
+			out = append(out, buf[:n]...)
+		default:
+			// C0/C1 control characters — replace with space
+			out = append(out, ' ')
 		}
 	}
 	return string(out)
+}
+
+// runeToLatin1Approx attempts a best-effort mapping of common Unicode
+// characters that fall outside Latin-1 to a Latin-1 approximation.
+// Used only as a fallback for code points > U+00FF.
+func runeToLatin1Approx(r rune) byte {
+	// Common lookalikes / decompositions
+	switch r {
+	case 0x2013, 0x2014: // en-dash, em-dash
+		return '-'
+	case 0x2018, 0x2019, 0x201A: // curly single quotes
+		return '\''
+	case 0x201C, 0x201D, 0x201E: // curly double quotes
+		return '"'
+	case 0x2026: // ellipsis
+		return '.'
+	case 0x20AC: // Euro sign — not in Latin-1, use E
+		return 'E'
+	}
+	return 0x20 // space
 }
