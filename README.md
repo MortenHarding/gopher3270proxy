@@ -87,10 +87,10 @@ CMD ["gopher3270proxy", "-host", "gopherspace.dk", "-listen", "3270", "-log", "/
 ```
 
 ```bash
-docker build -t gopher3270proxy .
+docker build -t mhardingdk/gopher:3270proxy .
 docker run -d -p 3270:3270 \
   -v /var/log:/var/log \
-  gopher3270proxy
+  mhardingdk/gopher:3270proxy
 ```
 
 ---
